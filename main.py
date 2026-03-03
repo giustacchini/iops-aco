@@ -53,24 +53,39 @@ while ((np.isin(np.nonzero(calculate_distance(coords)[0] != 0)[0], np.concatenat
     last_coord = current_solution[-1]
 
     while True:
-        ids = np.isin(np.nonzero(calculate_distance(coords)[last_coord] != 0)[0], np.concatenate([complete_solution[i] for i in range(len(complete_solution))]))
-        ids = np.insert(ids, 0, True)
-        dist_bw_coords = calculate_distance(coords)[last_coord][ids == False]
-        if len(dist_bw_coords) <= coords_to_keep:
-            best_dists = np.sort(dist_bw_coords)[1:len(dist_bw_coords)+1]
-        else:
-            best_dists = np.sort(dist_bw_coords)[1:coords_to_keep+1] # starting from 1 because we want to ignore dist 0
-        best_dists_idx = np.nonzero(np.isin(dist_bw_coords, best_dists) == True)[0]
-        # pick a random solution
-        rand_idx = np.random.randint(coords_to_keep)
-        if curr_sol_cap + cap_dem[best_dists_idx[rand_idx]] > cap_dem[0]:
+        # Get all unvisited nodes (all except node 0 and those already in complete_solution or current_solution)
+        visited_nodes = np.concatenate([complete_solution[i] for i in range(len(complete_solution))])
+        visited_nodes = np.concatenate([visited_nodes, current_solution])
+        all_nodes = np.arange(len(coords))
+        unvisited_nodes = np.setdiff1d(all_nodes, visited_nodes)
+        
+        # Get distances from last_coord to all unvisited nodes
+        distances_to_unvisited = calculate_distance(coords)[last_coord][unvisited_nodes]
+        
+        # If no unvisited nodes left, close this route
+        if len(unvisited_nodes) == 0:
             current_solution = np.append(current_solution, 0)
             complete_solution[count] = current_solution
             count += 1
             break
-        current_solution = np.append(current_solution, best_dists_idx[rand_idx])
-        curr_sol_cap += cap_dem[best_dists_idx[rand_idx]]
-        last_coord = current_solution[-1]
-    print(complete_solution)
-
-print(complete_solution, count)
+        
+        # Select k-nearest unvisited nodes
+        num_candidates = min(coords_to_keep, len(unvisited_nodes))
+        best_distances_indices = np.argsort(distances_to_unvisited)[:num_candidates]
+        best_unvisited_nodes = unvisited_nodes[best_distances_indices]
+        
+        # Pick a random node from the k-nearest
+        rand_idx = np.random.randint(num_candidates)
+        next_node = best_unvisited_nodes[rand_idx]
+        
+        # Check capacity constraint
+        if curr_sol_cap + cap_dem[next_node] > cap_dem[0]:
+            current_solution = np.append(current_solution, 0)
+            complete_solution[count] = current_solution
+            count += 1
+            break
+        
+        current_solution = np.append(current_solution, next_node)
+        curr_sol_cap += cap_dem[next_node]
+        last_coord = next_node
+    # print(complete_solution)
