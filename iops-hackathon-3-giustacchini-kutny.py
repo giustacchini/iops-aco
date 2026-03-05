@@ -118,6 +118,83 @@ class VrptwInstance(CvrpInstance):
 vrptw_data = VrptwInstance("instances/vrptw.txt")
 print(vrptw_data)
 
+# %%
+class PrpInstance(CvrpInstance):
+    """
+    The format of the data is as follows:
+
+    - The first line contains the following information:
+
+        m n t
+
+        where:
+            m = number of vehicles
+            n = number of customers
+            t = number of depots
+
+    - The next 't' lines contain, for each  depot, the maximum load of a vehicle
+
+    - The next 'n' lines contain, for each customer, the following information:
+
+        i x y d q e l
+
+        where :
+            i = customer number
+            x = x coordinate
+            y = y coordinate
+            d = service duration
+            q = demand
+            e = beginning of time window (earliest time for start of service)
+            l = end of time window (latest time for start of service)
+            
+
+    - The last 't' lines contain, for each depot, the following information:
+
+        i x y d q e l
+
+        where :
+            i = depot number
+            x = x coordinate
+            y = y coordinate
+            d = service duration (= 0)
+            q = demand (= 0)
+            e = beginning of time window
+            l = end of time window		
+    """
+    def __init__(self, filepath, metric='euclidean'):
+        with open(filepath, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        self.filepath = filepath
+        header = lines[0].split()
+        self.num_vehicles = int(header[0])
+        self.num_customers = int(header[1])
+        self.num_depots = int(header[2])
+        self.depot = np.array(lines[-4].split()[1:3], dtype=float)
+
+        # shape (n, 7): columns are customer_nr, x, y, service_duration, demand, tw_open, tw_close 
+        self.customers = np.loadtxt(lines[2:-4])
+
+        self.coords = np.vstack([self.depot, self.customers[:, 1:3]])
+        self.demands = np.concatenate([[0.0], self.customers[:, 4]])
+        
+        # # index 0 = depot (no constraint), 1..n = customers
+        self.service_time = np.concatenate([[0.0], self.customers[:, 3]])
+        self.tw_open = np.concatenate([[0.0], self.customers[:, 5]])
+        self.tw_close = np.concatenate([[1000.0], self.customers[:, 6]])
+
+        self.get_distance = get_dist_function(metric)
+        self.dist_matrix = self._compute_distance_matrix()
+
+    
+    def __repr__(self):
+        return f"PrpInstance(num_vehicles={self.num_vehicles}, capacity={self.num_customers}, depot={self.depot}, n={self.customers.shape[0]}, filepath={self.filepath})"
+
+prp_data = PrpInstance("instances/prp.txt")
+print(prp_data)
+
+
+
 # %% [markdown]
 # #### Stoppage criterions
 
@@ -1879,5 +1956,3 @@ plot_convergence({
 # - parameter tuning for alpha, beta, the solution selection method, and the number of ants did not significantly improve the results, because the performance of the ACO solvers varied between different executions due to randomness.
 # 
 # - changing the number of generations did not consistently improve the results either, since the speed of convergence mainly depended on the random behavior of the algorithm.
-
-
