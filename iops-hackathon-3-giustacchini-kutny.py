@@ -16,11 +16,11 @@ from datetime import datetime
 
 np.random.seed(12345)
 
-FINE_TUNE_GRASP = 0
-FINE_TUNE_AS = 0
-FINE_TUNE_MMAS = 0
-FINE_TUNE_ACS = 0
-FINE_TUNE_AMTS = 0
+FINE_TUNE_GRASP = 1
+FINE_TUNE_AS = 1
+FINE_TUNE_MMAS = 1
+FINE_TUNE_ACS = 1
+FINE_TUNE_AMTS = 1
 
 # %% [markdown]
 # ### Data loading
@@ -73,8 +73,8 @@ class CvrpInstance:
     def __repr__(self):
         return f"CvrpInstance(capacity={self.capacity}, depot={self.depot}, n={self.customers.shape[0]}, filepath={self.filepath})"
 
-cvrp_data = CvrpInstance("instances/cvrp.txt")
-print(cvrp_data)
+# cvrp_data = CvrpInstance("instances/cvrp.txt")
+# print(cvrp_data)
 
 # %% [markdown]
 # #### Vehicle Routing Problem with Time Windows (VRPTW):
@@ -115,8 +115,81 @@ class VrptwInstance(CvrpInstance):
     def __repr__(self):
         return f"VrptwInstance(num_vehicles={self.num_vehicles}, capacity={self.capacity}, depot={self.depot}, n={self.customers.shape[0]}, filepath={self.filepath})"
 
-vrptw_data = VrptwInstance("instances/vrptw.txt")
-print(vrptw_data)
+# vrptw_data = VrptwInstance("instances/vrptw.txt")
+# print(vrptw_data)
+
+# %% [markdown]
+# #### Pollution-Routing Problem (PRP)
+
+# %%
+class PrpInstance(VrptwInstance):
+    """
+    Loads a PRP instance from file. Extends VrptwInstance.
+    Format:
+        line 1: m n t (num_vehicles, num_customers, num_depots)
+        next t lines: vehicle capacity for each depot (single value per line)
+        next n lines: i x y d q e l (customer data)
+        last t lines: i x y d q e l (depot data)
+    """
+    def __init__(self, filepath, metric='euclidean'):
+        with open(filepath, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        self.filepath = filepath
+        header = lines[0].split()
+        self.num_vehicles = int(header[0])
+        n_customers = int(header[1])
+        self.num_depots = int(header[2]) if len(header) > 2 else 1
+
+        # Read t capacity lines
+        capacity_lines = [int(lines[1 + i]) for i in range(self.num_depots)]
+        self.capacity = capacity_lines[0]
+        self.depot_capacities = np.array(capacity_lines, dtype=float)
+
+        idx = 1 + self.num_depots
+        # Next n_customers lines: i x y d q e l
+        customer_data = np.loadtxt(lines[idx:idx + n_customers])
+        idx += n_customers
+
+        # Remaining lines are depot data: i x y d q e l
+        depot_data = np.loadtxt(lines[idx:])
+
+        self.customer_data = customer_data
+        self.depot_data = depot_data
+
+        # Use first depot as the primary depot (node 0)
+        self.depot = depot_data[0, 1:3] if depot_data.ndim > 1 else depot_data[1:3]
+
+        # Map PRP columns (i,x,y,d,q,e,l) to VrptwInstance format (x,y,demand,tw_open,tw_close,service_time)
+        self.customers = np.column_stack([
+            customer_data[:, 1],  # x
+            customer_data[:, 2],  # y
+            customer_data[:, 4],  # q (demand)
+            customer_data[:, 5],  # e (tw_open)
+            customer_data[:, 6],  # l (tw_close)
+            customer_data[:, 3],  # d (service_time)
+        ])
+
+        # coords[0] = primary depot, coords[1..n] = customers
+        all_depot_coords = depot_data[:, 1:3] if depot_data.ndim > 1 else depot_data[1:3].reshape(1, 2)
+        self.depot_coords = all_depot_coords
+        self.coords = np.vstack([self.depot, self.customers[:, :2]])
+        self.demands = np.concatenate([[0.0], self.customers[:, 2]])
+
+        self.tw_open = np.concatenate([[0.0], self.customers[:, 3]])
+        self.tw_close = np.concatenate([[np.inf], self.customers[:, 4]])
+        self.service_time = np.concatenate([[0.0], self.customers[:, 5]])
+
+        self.get_distance = get_dist_function(metric)
+        self.dist_matrix = self._compute_distance_matrix()
+
+    def __repr__(self):
+        return (f"PrpInstance(num_vehicles={self.num_vehicles}, capacity={self.capacity}, "
+                f"num_depots={self.num_depots}, depot={self.depot}, "
+                f"n={self.customers.shape[0]}, filepath={self.filepath})")
+
+prp_data = PrpInstance("instances/prp.txt")
+print(prp_data)
 
 # %% [markdown]
 # #### Stoppage criterions
@@ -198,6 +271,8 @@ def get_default_finetune_criteria():
 Route = np.ndarray
 DistanceMatrix = np.ndarray
 Solution = list[Route]
+# Type alias for all VRP instance types
+AnyInstance = CvrpInstance | VrptwInstance | PrpInstance
 
 def route_cost(route: Route, dist_matrix: DistanceMatrix) -> float:
     """Total distance of a single route (depot -> customers -> depot). Depot is node 0."""
@@ -209,6 +284,36 @@ def route_cost(route: Route, dist_matrix: DistanceMatrix) -> float:
 def solution_cost(routes: Solution, dist_matrix: DistanceMatrix) -> float:
     """Total distance across all routes."""
     return sum(route_cost(r, dist_matrix) for r in routes)
+
+def prp_route_cost(route: Route, instance) -> float:
+    """PRP cost: fuel (1.4 * distance) + pollution (weight * 0.0025) per segment."""
+    if route.shape[0] == 0:
+        return 0.0
+    nodes = np.concatenate(([0], route, [0]))
+    total = 0.0
+    current_weight = instance.demands[route].sum()
+    for i in range(len(nodes) - 1):
+        d = instance.dist_matrix[nodes[i], nodes[i + 1]]
+        fuel = 1.4 * d
+        pollution = current_weight * 0.0025
+        total += fuel + pollution
+        if i < len(route):
+            current_weight -= instance.demands[nodes[i + 1]]
+    return total
+
+def prp_solution_cost(routes: Solution, instance) -> float:
+    """Total PRP cost across all routes."""
+    return sum(prp_route_cost(r, instance) for r in routes)
+
+def _is_prp_instance(instance) -> bool:
+    """Check if instance is a PRP instance by checking class hierarchy names."""
+    return any(cls.__name__ == 'PrpInstance' for cls in type(instance).__mro__)
+
+def get_cost_function(instance):
+    """Return the appropriate cost function based on instance type."""
+    if _is_prp_instance(instance):
+        return lambda routes: prp_solution_cost(routes, instance)
+    return lambda routes: solution_cost(routes, instance.dist_matrix)
 
 def is_route_tw_feasible(route: Route, instance: VrptwInstance) -> bool:
     """Check if a single route satisfies time window constraints."""
@@ -237,6 +342,10 @@ def is_feasible_vrptw(routes: Solution, instance: VrptwInstance) -> bool:
         if not is_route_tw_feasible(route, instance):
             return False
     return True
+
+def is_feasible_prp(routes: Solution, instance) -> bool:
+    """Check capacity + time window constraints for PRP."""
+    return is_feasible_vrptw(routes, instance)
 
 # %% [markdown]
 # ### Local search operators
@@ -358,18 +467,19 @@ class SolverBase(ABC):
         self.criteria = criteria if len(criteria) > 0 else DEFAULT_CRITERIA
 
     @abstractmethod
-    def _construct(self, instance: CvrpInstance | VrptwInstance) -> Solution:
+    def _construct(self, instance: AnyInstance) -> Solution:
         """Construct a new solution."""
         ...
 
     @abstractmethod
-    def _improve(self, routes: Solution, instance: CvrpInstance | VrptwInstance) -> Solution:
+    def _improve(self, routes: Solution, instance: AnyInstance) -> Solution:
         """Improve a solution (e.g. local search)."""
         ...
 
-    def solve(self, instance: CvrpInstance | VrptwInstance) -> tuple[Solution, float, list[float]]:
+    def solve(self, instance: AnyInstance) -> tuple[Solution, float, list[float]]:
         """Main loop: construct, improve, track best. Stops when any criterion is met."""
         self.is_vrptw = isinstance(instance, VrptwInstance)
+        self.cost_fn = get_cost_function(instance)
         best_routes: Solution = []
         best_cost: float = np.inf
         history: list[float] = []
@@ -382,7 +492,7 @@ class SolverBase(ABC):
             routes = self._construct(instance)
             routes = self._improve(routes, instance)
 
-            cost = solution_cost(routes, instance.dist_matrix)
+            cost = self.cost_fn(routes)
             if cost < best_cost:
                 best_cost = cost
                 best_routes = [r.copy() for r in routes]
@@ -409,7 +519,7 @@ class GraspSolver(SolverBase):
         super().__init__(criteria)
         self.alpha = alpha
 
-    def _construct(self, instance: CvrpInstance | VrptwInstance) -> Solution:
+    def _construct(self, instance: AnyInstance) -> Solution:
         """
         Greedy Randomized Adaptive construction.
         - Greedy function: distance from current node to candidates (lower = better)
@@ -468,7 +578,7 @@ class GraspSolver(SolverBase):
 
         return routes
 
-    def _improve(self, routes: Solution, instance: CvrpInstance | VrptwInstance) -> Solution:
+    def _improve(self, routes: Solution, instance: AnyInstance) -> Solution:
         """Improve solution via local search."""
         return local_search(routes, instance)
 
@@ -477,7 +587,7 @@ class GraspSolver(SolverBase):
 
 # %%
 def fine_tune(
-    instance: CvrpInstance | VrptwInstance,
+    instance: AnyInstance,
     run_name: str,
     config_generator,  # (multiplier) -> dict of config params
     result_generator,  # (config_dict, instance) -> (routes, cost, history)
@@ -487,12 +597,22 @@ def fine_tune(
 ):
     results_dir = "results"
     os.makedirs(results_dir, exist_ok=True)
-    inst_type = "vrptw" if isinstance(instance, VrptwInstance) else "cvrp"
+    if _is_prp_instance(instance):
+        inst_type = "prp"
+    elif isinstance(instance, VrptwInstance):
+        inst_type = "vrptw"
+    else:
+        inst_type = "cvrp"
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     results_file = os.path.join(results_dir, f"{timestamp}_{inst_type}{run_name}.csv")
     results_img = os.path.join(results_dir, f"{timestamp}_{inst_type}{run_name}.jpg")
 
-    is_feasible = is_feasible_vrptw if isinstance(instance, VrptwInstance) else is_feasible_cvrp
+    if _is_prp_instance(instance):
+        is_feasible = is_feasible_prp
+    elif isinstance(instance, VrptwInstance):
+        is_feasible = is_feasible_vrptw
+    else:
+        is_feasible = is_feasible_cvrp
 
     multiplier_step = (multiplier - min_multiplier) / n_iters
     best_cost = np.inf
@@ -595,37 +715,53 @@ if FINE_TUNE_GRASP > 0:
         solver = GraspSolver(alpha=config["alpha"], criteria=get_default_finetune_criteria())
         return solver.solve(instance)
 
-    print("=== CVRP ===")
-    cvrp_routes, cvrp_cost, cvrp_history, best_cfg = fine_tune(
-        instance=cvrp_data,
-        run_name="_grasp",
-        config_generator=grasp_config,
-        result_generator=grasp_solver,
-        n_iters=FINE_TUNE_GRASP,
-    )
+    # print("=== CVRP ===")
+    # cvrp_routes, cvrp_cost, cvrp_history, best_cfg = fine_tune(
+    #     instance=cvrp_data,
+    #     run_name="_grasp",
+    #     config_generator=grasp_config,
+    #     result_generator=grasp_solver,
+    #     n_iters=FINE_TUNE_GRASP,
+    # )
 
-    print("\n=== VRPTW ===")
-    vrptw_routes, vrptw_cost, vrptw_history, best_cfg = fine_tune(
-        instance=vrptw_data,
+    # print("\n=== VRPTW ===")
+    # vrptw_routes, vrptw_cost, vrptw_history, best_cfg = fine_tune(
+    #     instance=vrptw_data,
+    #     run_name="_grasp",
+    #     config_generator=grasp_config,
+    #     result_generator=grasp_solver,
+    #     n_iters=FINE_TUNE_GRASP,
+    # )
+
+    print("\n=== PRP ===")
+    prp_routes, prp_cost, prp_history, best_cfg = fine_tune(
+        instance=prp_data,
         run_name="_grasp",
         config_generator=grasp_config,
         result_generator=grasp_solver,
         n_iters=FINE_TUNE_GRASP,
     )
 else:
-    print("=== CVRP ===")
-    start = time.monotonic()
-    grasp = GraspSolver(alpha=0.496, criteria=get_default_criteria())
-    cvrp_routes, cvrp_cost, cvrp_history = grasp.solve(cvrp_data)
-    elapsed = time.monotonic() - start
-    print(f"  Cost: {cvrp_cost:.2f}, Routes: {len(cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(cvrp_history)}, Feasible: {is_feasible_cvrp(cvrp_routes, cvrp_data)}")
+    # print("=== CVRP ===")
+    # start = time.monotonic()
+    # grasp = GraspSolver(alpha=0.496, criteria=get_default_criteria())
+    # cvrp_routes, cvrp_cost, cvrp_history = grasp.solve(cvrp_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {cvrp_cost:.2f}, Routes: {len(cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(cvrp_history)}, Feasible: {is_feasible_cvrp(cvrp_routes, cvrp_data)}")
 
-    print("\n=== VRPTW ===")
+    # print("\n=== VRPTW ===")
+    # start = time.monotonic()
+    # grasp_vrptw = GraspSolver(alpha=0.4789, criteria=get_default_criteria())
+    # vrptw_routes, vrptw_cost, vrptw_history = grasp_vrptw.solve(vrptw_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {vrptw_cost:.2f}, Routes: {len(vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(cvrp_history)}, Feasible: {is_feasible_vrptw(vrptw_routes, vrptw_data)}")
+
+    print("\n=== PRP ===")
     start = time.monotonic()
-    grasp_vrptw = GraspSolver(alpha=0.4789, criteria=get_default_criteria())
-    vrptw_routes, vrptw_cost, vrptw_history = grasp_vrptw.solve(vrptw_data)
+    grasp_prp = GraspSolver(alpha=0.4789, criteria=get_default_criteria())
+    prp_routes, prp_cost, prp_history = grasp_prp.solve(prp_data)
     elapsed = time.monotonic() - start
-    print(f"  Cost: {vrptw_cost:.2f}, Routes: {len(vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(cvrp_history)}, Feasible: {is_feasible_vrptw(vrptw_routes, vrptw_data)}")
+    print(f"  Cost: {prp_cost:.2f}, Routes: {len(prp_routes)}, Time: {elapsed:.2f}s, Generations: {len(prp_history)}, Feasible: {is_feasible_prp(prp_routes, prp_data)}")
 
 # %% [markdown]
 # ### Ant Colony Optimization (ACO)
@@ -649,7 +785,7 @@ class ACOSolverBase(SolverBase):
         self.rho = rho      # evaporation rate
         self.tau = None     # pheromone matrix (initialized per instance)
 
-    def _nearest_neighbor_cost(self, instance: CvrpInstance | VrptwInstance) -> float:
+    def _nearest_neighbor_cost(self, instance: AnyInstance) -> float:
         """Compute nearest neighbor heuristic cost for pheromone initialization."""
         dm = instance.dist_matrix
         n = len(instance.demands) - 1
@@ -687,7 +823,7 @@ class ACOSolverBase(SolverBase):
 
         return cost + dm[current, 0]
 
-    def _construct_ant_solution(self, instance: CvrpInstance | VrptwInstance) -> Solution:
+    def _construct_ant_solution(self, instance: AnyInstance) -> Solution:
         """
         Construct a single ant's solution using probabilistic selection.
         P_ij(t) = [tau_ij(t)]^alpha * [eta_ij(t)]^beta 
@@ -741,7 +877,7 @@ class ACOSolverBase(SolverBase):
 
         return routes
 
-    def _construct(self, instance: CvrpInstance | VrptwInstance) -> Solution:
+    def _construct(self, instance: AnyInstance) -> Solution:
         """Construct solution with all ants; return best route from this iteration."""
         all_routes = []
         all_costs = []
@@ -749,7 +885,7 @@ class ACOSolverBase(SolverBase):
         # Each ant builds a solution
         for _ in range(self.n_ants):
             routes = self._construct_ant_solution(instance)
-            cost = solution_cost(routes, instance.dist_matrix)
+            cost = self.cost_fn(routes)
             all_routes.append(routes)
             all_costs.append(cost)
 
@@ -785,14 +921,15 @@ class ACOSolverBase(SolverBase):
                 self.tau[nodes[i], nodes[i + 1]] += delta
                 self.tau[nodes[i + 1], nodes[i]] += delta
 
-    def _improve(self, routes: Solution, instance: CvrpInstance | VrptwInstance) -> Solution:
+    def _improve(self, routes: Solution, instance: AnyInstance) -> Solution:
         """Improve solution via local search."""
         return local_search(routes, instance)
 
-    def solve(self, instance: CvrpInstance | VrptwInstance) -> tuple[Solution, float, list[float]]:
+    def solve(self, instance: AnyInstance) -> tuple[Solution, float, list[float]]:
         """ACO main loop: all ants construct, update pheromones, track best."""
         self.is_vrptw = isinstance(instance, VrptwInstance)
-        
+        self.cost_fn = get_cost_function(instance)
+
         # Initialize pheromone matrix
         dm = instance.dist_matrix
         c_nn = self._nearest_neighbor_cost(instance)
@@ -812,7 +949,7 @@ class ACOSolverBase(SolverBase):
             routes = self._construct(instance)
             routes = self._improve(routes, instance)
 
-            cost = solution_cost(routes, instance.dist_matrix)
+            cost = self.cost_fn(routes)
             if cost < best_cost:
                 best_cost = cost
                 best_routes = [r.copy() for r in routes]
@@ -912,10 +1049,11 @@ class AntSystem(ACOSolverBase):
                     self.tau[nodes[i], nodes[i + 1]] += delta
                     self.tau[nodes[i + 1], nodes[i]] += delta
 
-    def solve(self, instance: CvrpInstance | VrptwInstance) -> tuple[Solution, float, list[float]]:
+    def solve(self, instance: AnyInstance) -> tuple[Solution, float, list[float]]:
         """AS main loop: all ants construct, update pheromones with selection type, track best."""
         self.is_vrptw = isinstance(instance, VrptwInstance)
-        
+        self.cost_fn = get_cost_function(instance)
+
         # Initialize pheromone matrix
         dm = instance.dist_matrix
         c_nn = self._nearest_neighbor_cost(instance)
@@ -937,7 +1075,7 @@ class AntSystem(ACOSolverBase):
             routes = self._construct(instance)
             routes = self._improve(routes, instance)
 
-            cost = solution_cost(routes, instance.dist_matrix)
+            cost = self.cost_fn(routes)
             if cost < best_cost:
                 best_cost = cost
                 best_routes = [r.copy() for r in routes]
@@ -985,35 +1123,49 @@ if FINE_TUNE_AS > 0:
         )
         return solver.solve(instance)
 
-    print("=== AS CVRP ===")
-    as_cvrp_routes, as_cvrp_cost, as_cvrp_history, best_cfg = fine_tune(
-        instance=cvrp_data, run_name="_as",
-        config_generator=as_config, result_generator=as_solver,
-        n_iters=FINE_TUNE_AS,
-    )
-    best_as_alpha, best_as_beta = best_cfg["alpha"], best_cfg["beta"]
-    best_as_rho, best_as_n_ants = best_cfg["rho"], best_cfg["n_ants"]
+    # print("=== AS CVRP ===")
+    # as_cvrp_routes, as_cvrp_cost, as_cvrp_history, best_cfg = fine_tune(
+    #     instance=cvrp_data, run_name="_as",
+    #     config_generator=as_config, result_generator=as_solver,
+    #     n_iters=FINE_TUNE_AS,
+    # )
+    # best_as_alpha, best_as_beta = best_cfg["alpha"], best_cfg["beta"]
+    # best_as_rho, best_as_n_ants = best_cfg["rho"], best_cfg["n_ants"]
 
-    print("\n=== AS VRPTW ===")
-    as_vrptw_routes, as_vrptw_cost, as_vrptw_history, best_cfg = fine_tune(
-        instance=vrptw_data, run_name="_as",
+    # print("\n=== AS VRPTW ===")
+    # as_vrptw_routes, as_vrptw_cost, as_vrptw_history, best_cfg = fine_tune(
+    #     instance=vrptw_data, run_name="_as",
+    #     config_generator=as_config, result_generator=as_solver,
+    #     n_iters=FINE_TUNE_AS,
+    # )
+
+    print("\n=== AS PRP ===")
+    as_prp_routes, as_prp_cost, as_prp_history, best_cfg = fine_tune(
+        instance=prp_data, run_name="_as",
         config_generator=as_config, result_generator=as_solver,
         n_iters=FINE_TUNE_AS,
     )
 else:
-    print("=== AS CVRP ===")
-    start = time.monotonic()
-    ant_system = AntSystem(n_ants=23, alpha=1.0675, beta=2.0087, rho=0.1072, criteria=get_default_criteria())
-    as_cvrp_routes, as_cvrp_cost, as_cvrp_history = ant_system.solve(cvrp_data)
-    elapsed = time.monotonic() - start
-    print(f"  Cost: {as_cvrp_cost:.2f}, Routes: {len(as_cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(as_cvrp_history)}, Feasible: {is_feasible_cvrp(as_cvrp_routes, cvrp_data)}")
+    # print("=== AS CVRP ===")
+    # start = time.monotonic()
+    # ant_system = AntSystem(n_ants=23, alpha=1.0675, beta=2.0087, rho=0.1072, criteria=get_default_criteria())
+    # as_cvrp_routes, as_cvrp_cost, as_cvrp_history = ant_system.solve(cvrp_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {as_cvrp_cost:.2f}, Routes: {len(as_cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(as_cvrp_history)}, Feasible: {is_feasible_cvrp(as_cvrp_routes, cvrp_data)}")
 
-    print("\n=== AS VRPTW ===")
+    # print("\n=== AS VRPTW ===")
+    # start = time.monotonic()
+    # as_vrptw = AntSystem(n_ants=23, alpha=1.0967, beta=1.9828, rho=0.1034, criteria=get_default_criteria())
+    # as_vrptw_routes, as_vrptw_cost, as_vrptw_history = as_vrptw.solve(vrptw_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {as_vrptw_cost:.2f}, Routes: {len(as_vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(as_vrptw_history)}, Feasible: {is_feasible_vrptw(as_vrptw_routes, vrptw_data)}")
+
+    print("\n=== AS PRP ===")
     start = time.monotonic()
-    as_vrptw = AntSystem(n_ants=23, alpha=1.0967, beta=1.9828, rho=0.1034, criteria=get_default_criteria())
-    as_vrptw_routes, as_vrptw_cost, as_vrptw_history = as_vrptw.solve(vrptw_data)
+    as_prp = AntSystem(n_ants=23, alpha=1.0967, beta=1.9828, rho=0.1034, criteria=get_default_criteria())
+    as_prp_routes, as_prp_cost, as_prp_history = as_prp.solve(prp_data)
     elapsed = time.monotonic() - start
-    print(f"  Cost: {as_vrptw_cost:.2f}, Routes: {len(as_vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(as_vrptw_history)}, Feasible: {is_feasible_vrptw(as_vrptw_routes, vrptw_data)}")
+    print(f"  Cost: {as_prp_cost:.2f}, Routes: {len(as_prp_routes)}, Time: {elapsed:.2f}s, Generations: {len(as_prp_history)}, Feasible: {is_feasible_prp(as_prp_routes, prp_data)}")
 
 # %% [markdown]
 # #### MAX-MIN Ant System
@@ -1052,10 +1204,11 @@ class MaxMinAntSystem(ACOSolverBase):
                 self.tau[nodes[i], nodes[i + 1]] += delta
                 self.tau[nodes[i + 1], nodes[i]] += delta
 
-    def solve(self, instance: CvrpInstance | VrptwInstance) -> tuple[Solution, float, list[float]]:
+    def solve(self, instance: AnyInstance) -> tuple[Solution, float, list[float]]:
         """MAX-MIN AS: construct, update from best-so-far only, reinitialize periodically."""
         self.is_vrptw = isinstance(instance, VrptwInstance)
-        
+        self.cost_fn = get_cost_function(instance)
+
         # Initialize pheromone matrix
         dm = instance.dist_matrix
         c_nn = self._nearest_neighbor_cost(instance)
@@ -1076,7 +1229,7 @@ class MaxMinAntSystem(ACOSolverBase):
             routes = self._construct(instance)
             routes = self._improve(routes, instance)
 
-            cost = solution_cost(routes, instance.dist_matrix)
+            cost = self.cost_fn(routes)
             if cost < best_cost:
                 best_cost = cost
                 best_routes = [r.copy() for r in routes]
@@ -1134,36 +1287,50 @@ if FINE_TUNE_MMAS > 0:
         )
         return solver.solve(instance)
 
-    print("=== MAX-MIN AS CVRP ===")
-    mm_as_cvrp_routes, mm_as_cvrp_cost, mm_as_cvrp_history, best_cfg = fine_tune(
-        instance=cvrp_data, run_name="_mmas",
-        config_generator=mmas_config, result_generator=mmas_solver,
-        n_iters=FINE_TUNE_MMAS,
-    )
-    best_mmas_alpha, best_mmas_beta = best_cfg["alpha"], best_cfg["beta"]
-    best_mmas_rho, best_mmas_n_ants = best_cfg["rho"], best_cfg["n_ants"]
-    best_mmas_reinit = best_cfg["reinit_frequency"]
+    # print("=== MAX-MIN AS CVRP ===")
+    # mm_as_cvrp_routes, mm_as_cvrp_cost, mm_as_cvrp_history, best_cfg = fine_tune(
+    #     instance=cvrp_data, run_name="_mmas",
+    #     config_generator=mmas_config, result_generator=mmas_solver,
+    #     n_iters=FINE_TUNE_MMAS,
+    # )
+    # best_mmas_alpha, best_mmas_beta = best_cfg["alpha"], best_cfg["beta"]
+    # best_mmas_rho, best_mmas_n_ants = best_cfg["rho"], best_cfg["n_ants"]
+    # best_mmas_reinit = best_cfg["reinit_frequency"]
 
-    print("\n=== MAX-MIN AS VRPTW ===")
-    mm_as_vrptw_routes, mm_as_vrptw_cost, mm_as_vrptw_history, best_cfg = fine_tune(
-        instance=vrptw_data, run_name="_mmas",
+    # print("\n=== MAX-MIN AS VRPTW ===")
+    # mm_as_vrptw_routes, mm_as_vrptw_cost, mm_as_vrptw_history, best_cfg = fine_tune(
+    #     instance=vrptw_data, run_name="_mmas",
+    #     config_generator=mmas_config, result_generator=mmas_solver,
+    #     n_iters=FINE_TUNE_MMAS,
+    # )
+
+    print("\n=== MAX-MIN AS PRP ===")
+    mm_as_prp_routes, mm_as_prp_cost, mm_as_prp_history, best_cfg = fine_tune(
+        instance=prp_data, run_name="_mmas",
         config_generator=mmas_config, result_generator=mmas_solver,
         n_iters=FINE_TUNE_MMAS,
     )
 else:
-    print("=== MAX-MIN AS CVRP ===")
-    start = time.monotonic()
-    max_min_ant_system = MaxMinAntSystem(n_ants=21, alpha=0.9757, beta=1.9467, rho=0.0987, reinit_frequency=97, criteria=get_default_criteria())
-    mm_as_cvrp_routes, mm_as_cvrp_cost, mm_as_cvrp_history = max_min_ant_system.solve(cvrp_data)
-    elapsed = time.monotonic() - start
-    print(f"  Cost: {mm_as_cvrp_cost:.2f}, Routes: {len(mm_as_cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(mm_as_cvrp_history)}, Feasible: {is_feasible_cvrp(mm_as_cvrp_routes, cvrp_data)}")
+    # print("=== MAX-MIN AS CVRP ===")
+    # start = time.monotonic()
+    # max_min_ant_system = MaxMinAntSystem(n_ants=21, alpha=0.9757, beta=1.9467, rho=0.0987, reinit_frequency=97, criteria=get_default_criteria())
+    # mm_as_cvrp_routes, mm_as_cvrp_cost, mm_as_cvrp_history = max_min_ant_system.solve(cvrp_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {mm_as_cvrp_cost:.2f}, Routes: {len(mm_as_cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(mm_as_cvrp_history)}, Feasible: {is_feasible_cvrp(mm_as_cvrp_routes, cvrp_data)}")
 
-    print("\n=== MAX-MIN AS VRPTW ===")
+    # print("\n=== MAX-MIN AS VRPTW ===")
+    # start = time.monotonic()
+    # mm_as_vrptw = MaxMinAntSystem(n_ants=19, alpha=1.0058, beta=1.8397, rho=0.0953, reinit_frequency=91, criteria=get_default_criteria())
+    # mm_as_vrptw_routes, mm_as_vrptw_cost, mm_as_vrptw_history = mm_as_vrptw.solve(vrptw_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {mm_as_vrptw_cost:.2f}, Routes: {len(mm_as_vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(mm_as_vrptw_history)}, Feasible: {is_feasible_vrptw(mm_as_vrptw_routes, vrptw_data)}")
+
+    print("\n=== MAX-MIN AS PRP ===")
     start = time.monotonic()
-    mm_as_vrptw = MaxMinAntSystem(n_ants=19, alpha=1.0058, beta=1.8397, rho=0.0953, reinit_frequency=91, criteria=get_default_criteria())
-    mm_as_vrptw_routes, mm_as_vrptw_cost, mm_as_vrptw_history = mm_as_vrptw.solve(vrptw_data)
+    mm_as_prp = MaxMinAntSystem(n_ants=19, alpha=1.0058, beta=1.8397, rho=0.0953, reinit_frequency=91, criteria=get_default_criteria())
+    mm_as_prp_routes, mm_as_prp_cost, mm_as_prp_history = mm_as_prp.solve(prp_data)
     elapsed = time.monotonic() - start
-    print(f"  Cost: {mm_as_vrptw_cost:.2f}, Routes: {len(mm_as_vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(mm_as_vrptw_history)}, Feasible: {is_feasible_vrptw(mm_as_vrptw_routes, vrptw_data)}")
+    print(f"  Cost: {mm_as_prp_cost:.2f}, Routes: {len(mm_as_prp_routes)}, Time: {elapsed:.2f}s, Generations: {len(mm_as_prp_history)}, Feasible: {is_feasible_prp(mm_as_prp_routes, prp_data)}")
 
 # %% [markdown]
 # #### Ant Colony System
@@ -1188,7 +1355,7 @@ class AntColonySystem(ACOSolverBase):
         self.best_cost = np.inf
         self.best_routes = None
 
-    def _construct_ant_solution(self, instance: CvrpInstance | VrptwInstance) -> Solution:
+    def _construct_ant_solution(self, instance: AnyInstance) -> Solution:
         """Construct using ACS rule: exploit with probability q0, otherwise explore."""
         dm = instance.dist_matrix
         n = len(instance.demands) - 1
@@ -1267,10 +1434,11 @@ class AntColonySystem(ACOSolverBase):
                                                    self.p_update * delta
                 self.tau[nodes[i + 1], nodes[i]] = self.tau[nodes[i], nodes[i + 1]]
 
-    def solve(self, instance: CvrpInstance | VrptwInstance) -> tuple[Solution, float, list[float]]:
+    def solve(self, instance: AnyInstance) -> tuple[Solution, float, list[float]]:
         """ACS: construct with local updates, global update from best, track best."""
         self.is_vrptw = isinstance(instance, VrptwInstance)
-        
+        self.cost_fn = get_cost_function(instance)
+
         # Initialize pheromone matrix
         dm = instance.dist_matrix
         c_nn = self._nearest_neighbor_cost(instance)
@@ -1292,7 +1460,7 @@ class AntColonySystem(ACOSolverBase):
             routes = self._construct(instance)
             routes = self._improve(routes, instance)
 
-            cost = solution_cost(routes, instance.dist_matrix)
+            cost = self.cost_fn(routes)
             if cost < best_cost:
                 best_cost = cost
                 best_routes = [r.copy() for r in routes]
@@ -1356,37 +1524,51 @@ if FINE_TUNE_ACS > 0:
         )
         return solver.solve(instance)
 
-    print("=== ACS CVRP ===")
-    acs_cvrp_routes, acs_cvrp_cost, acs_cvrp_history, best_cfg = fine_tune(
-        instance=cvrp_data, run_name="_acs",
-        config_generator=acs_config, result_generator=acs_solver,
-        n_iters=FINE_TUNE_ACS,
-    )
-    best_acs_alpha, best_acs_beta = best_cfg["alpha"], best_cfg["beta"]
-    best_acs_rho, best_acs_n_ants = best_cfg["rho"], best_cfg["n_ants"]
-    best_acs_q0, best_acs_p_update = best_cfg["q0"], best_cfg["p_update"]
-    best_acs_local_alpha = best_cfg["local_alpha"]
+    # print("=== ACS CVRP ===")
+    # acs_cvrp_routes, acs_cvrp_cost, acs_cvrp_history, best_cfg = fine_tune(
+    #     instance=cvrp_data, run_name="_acs",
+    #     config_generator=acs_config, result_generator=acs_solver,
+    #     n_iters=FINE_TUNE_ACS,
+    # )
+    # best_acs_alpha, best_acs_beta = best_cfg["alpha"], best_cfg["beta"]
+    # best_acs_rho, best_acs_n_ants = best_cfg["rho"], best_cfg["n_ants"]
+    # best_acs_q0, best_acs_p_update = best_cfg["q0"], best_cfg["p_update"]
+    # best_acs_local_alpha = best_cfg["local_alpha"]
 
-    print("\n=== ACS VRPTW ===")
-    acs_vrptw_routes, acs_vrptw_cost, acs_vrptw_history, best_cfg = fine_tune(
-        instance=vrptw_data, run_name="_acs",
+    # print("\n=== ACS VRPTW ===")
+    # acs_vrptw_routes, acs_vrptw_cost, acs_vrptw_history, best_cfg = fine_tune(
+    #     instance=vrptw_data, run_name="_acs",
+    #     config_generator=acs_config, result_generator=acs_solver,
+    #     n_iters=FINE_TUNE_ACS,
+    # )
+
+    print("\n=== ACS PRP ===")
+    acs_prp_routes, acs_prp_cost, acs_prp_history, best_cfg = fine_tune(
+        instance=prp_data, run_name="_acs",
         config_generator=acs_config, result_generator=acs_solver,
         n_iters=FINE_TUNE_ACS,
     )
 else:
-    print("=== ACS CVRP ===")
-    start = time.monotonic()
-    ant_colony_system = AntColonySystem(n_ants=19, alpha=1.0143, beta=1.9246, rho=0.0959, q0=0.8711, p_update=0.0992, local_alpha=0.1027, criteria=get_default_criteria())
-    acs_cvrp_routes, acs_cvrp_cost, acs_cvrp_history = ant_colony_system.solve(cvrp_data)
-    elapsed = time.monotonic() - start
-    print(f"  Cost: {acs_cvrp_cost:.2f}, Routes: {len(acs_cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(acs_cvrp_history)}, Feasible: {is_feasible_cvrp(acs_cvrp_routes, cvrp_data)}")
+    # print("=== ACS CVRP ===")
+    # start = time.monotonic()
+    # ant_colony_system = AntColonySystem(n_ants=19, alpha=1.0143, beta=1.9246, rho=0.0959, q0=0.8711, p_update=0.0992, local_alpha=0.1027, criteria=get_default_criteria())
+    # acs_cvrp_routes, acs_cvrp_cost, acs_cvrp_history = ant_colony_system.solve(cvrp_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {acs_cvrp_cost:.2f}, Routes: {len(acs_cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(acs_cvrp_history)}, Feasible: {is_feasible_cvrp(acs_cvrp_routes, cvrp_data)}")
 
-    print("\n=== ACS VRPTW ===")
+    # print("\n=== ACS VRPTW ===")
+    # start = time.monotonic()
+    # acs_vrptw = AntColonySystem(n_ants=17, alpha=1.0281, beta=1.7183, rho=0.1052, q0=0.8904, p_update=0.1002, local_alpha=0.0962, criteria=get_default_criteria())
+    # acs_vrptw_routes, acs_vrptw_cost, acs_vrptw_history = acs_vrptw.solve(vrptw_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {acs_vrptw_cost:.2f}, Routes: {len(acs_vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(acs_vrptw_history)}, Feasible: {is_feasible_vrptw(acs_vrptw_routes, vrptw_data)}")
+
+    print("\n=== ACS PRP ===")
     start = time.monotonic()
-    acs_vrptw = AntColonySystem(n_ants=17, alpha=1.0281, beta=1.7183, rho=0.1052, q0=0.8904, p_update=0.1002, local_alpha=0.0962, criteria=get_default_criteria())
-    acs_vrptw_routes, acs_vrptw_cost, acs_vrptw_history = acs_vrptw.solve(vrptw_data)
+    acs_prp = AntColonySystem(n_ants=17, alpha=1.0281, beta=1.7183, rho=0.1052, q0=0.8904, p_update=0.1002, local_alpha=0.0962, criteria=get_default_criteria())
+    acs_prp_routes, acs_prp_cost, acs_prp_history = acs_prp.solve(prp_data)
     elapsed = time.monotonic() - start
-    print(f"  Cost: {acs_vrptw_cost:.2f}, Routes: {len(acs_vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(acs_vrptw_history)}, Feasible: {is_feasible_vrptw(acs_vrptw_routes, vrptw_data)}")
+    print(f"  Cost: {acs_prp_cost:.2f}, Routes: {len(acs_prp_routes)}, Time: {elapsed:.2f}s, Generations: {len(acs_prp_history)}, Feasible: {is_feasible_prp(acs_prp_routes, prp_data)}")
 
 # %% [markdown]
 # #### Ant Multitour System
@@ -1406,7 +1588,7 @@ class AntMultiTourSystem(ACOSolverBase):
         self.q_tours = q_tours
         self.edge_usage = None
 
-    def _construct_ant_solution(self, instance: CvrpInstance | VrptwInstance) -> Solution:
+    def _construct_ant_solution(self, instance: AnyInstance) -> Solution:
         """Construct using attractiveness with edge usage penalty."""
         dm = instance.dist_matrix
         n = len(instance.demands) - 1
@@ -1475,10 +1657,11 @@ class AntMultiTourSystem(ACOSolverBase):
         """Decay edge usage frequencies to forget old patterns."""
         self.edge_usage *= 0.9
 
-    def solve(self, instance: CvrpInstance | VrptwInstance) -> tuple[Solution, float, list[float]]:
+    def solve(self, instance: AnyInstance) -> tuple[Solution, float, list[float]]:
         """Multitour: track edge usage, construct with penalties, update pheromones."""
         self.is_vrptw = isinstance(instance, VrptwInstance)
-        
+        self.cost_fn = get_cost_function(instance)
+
         # Initialize pheromone matrix and edge usage tracking
         dm = instance.dist_matrix
         c_nn = self._nearest_neighbor_cost(instance)
@@ -1499,7 +1682,7 @@ class AntMultiTourSystem(ACOSolverBase):
             routes = self._construct(instance)
             routes = self._improve(routes, instance)
 
-            cost = solution_cost(routes, instance.dist_matrix)
+            cost = self.cost_fn(routes)
             if cost < best_cost:
                 best_cost = cost
                 best_routes = [r.copy() for r in routes]
@@ -1559,36 +1742,50 @@ if FINE_TUNE_AMTS > 0:
         )
         return solver.solve(instance)
 
-    print("=== AMTS CVRP ===")
-    amts_cvrp_routes, amts_cvrp_cost, amts_cvrp_history, best_cfg = fine_tune(
-        instance=cvrp_data, run_name="_amts",
-        config_generator=amts_config, result_generator=amts_solver,
-        n_iters=FINE_TUNE_AMTS,
-    )
-    best_amts_alpha, best_amts_beta = best_cfg["alpha"], best_cfg["beta"]
-    best_amts_rho, best_amts_n_ants = best_cfg["rho"], best_cfg["n_ants"]
-    best_amts_q_tours = best_cfg["q_tours"]
+    # print("=== AMTS CVRP ===")
+    # amts_cvrp_routes, amts_cvrp_cost, amts_cvrp_history, best_cfg = fine_tune(
+    #     instance=cvrp_data, run_name="_amts",
+    #     config_generator=amts_config, result_generator=amts_solver,
+    #     n_iters=FINE_TUNE_AMTS,
+    # )
+    # best_amts_alpha, best_amts_beta = best_cfg["alpha"], best_cfg["beta"]
+    # best_amts_rho, best_amts_n_ants = best_cfg["rho"], best_cfg["n_ants"]
+    # best_amts_q_tours = best_cfg["q_tours"]
 
-    print("\n=== AMTS VRPTW ===")
-    amts_vrptw_routes, amts_vrptw_cost, amts_vrptw_history, best_cfg = fine_tune(
-        instance=vrptw_data, run_name="_amts",
+    # print("\n=== AMTS VRPTW ===")
+    # amts_vrptw_routes, amts_vrptw_cost, amts_vrptw_history, best_cfg = fine_tune(
+    #     instance=vrptw_data, run_name="_amts",
+    #     config_generator=amts_config, result_generator=amts_solver,
+    #     n_iters=FINE_TUNE_AMTS,
+    # )
+
+    print("\n=== AMTS PRP ===")
+    amts_prp_routes, amts_prp_cost, amts_prp_history, best_cfg = fine_tune(
+        instance=prp_data, run_name="_amts",
         config_generator=amts_config, result_generator=amts_solver,
         n_iters=FINE_TUNE_AMTS,
     )
 else:
-    print("=== Ant Multitour System CVRP ===")
-    start = time.monotonic()
-    ant_multitour_system = AntMultiTourSystem(n_ants=20, alpha=0.9998, beta=1.9038, rho=0.1033, q_tours=5, criteria=get_default_criteria())
-    amts_cvrp_routes, amts_cvrp_cost, amts_cvrp_history = ant_multitour_system.solve(cvrp_data)
-    elapsed = time.monotonic() - start
-    print(f"  Cost: {amts_cvrp_cost:.2f}, Routes: {len(amts_cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(amts_cvrp_history)}, Feasible: {is_feasible_cvrp(amts_cvrp_routes, cvrp_data)}")
+    # print("=== Ant Multitour System CVRP ===")
+    # start = time.monotonic()
+    # ant_multitour_system = AntMultiTourSystem(n_ants=20, alpha=0.9998, beta=1.9038, rho=0.1033, q_tours=5, criteria=get_default_criteria())
+    # amts_cvrp_routes, amts_cvrp_cost, amts_cvrp_history = ant_multitour_system.solve(cvrp_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {amts_cvrp_cost:.2f}, Routes: {len(amts_cvrp_routes)}, Time: {elapsed:.2f}s, Generations: {len(amts_cvrp_history)}, Feasible: {is_feasible_cvrp(amts_cvrp_routes, cvrp_data)}")
 
-    print("\n=== ANT MULTITOUR SYSTEM VRPTW ===")
+    # print("\n=== ANT MULTITOUR SYSTEM VRPTW ===")
+    # start = time.monotonic()
+    # amts_vrptw = AntMultiTourSystem(n_ants=19, alpha=1.0102, beta=1.9535, rho=0.1059, q_tours=5, criteria=get_default_criteria())
+    # amts_vrptw_routes, amts_vrptw_cost, amts_vrptw_history = amts_vrptw.solve(vrptw_data)
+    # elapsed = time.monotonic() - start
+    # print(f"  Cost: {amts_vrptw_cost:.2f}, Routes: {len(amts_vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(amts_vrptw_history)}, Feasible: {is_feasible_vrptw(amts_vrptw_routes, vrptw_data)}")
+
+    print("\n=== AMTS PRP ===")
     start = time.monotonic()
-    amts_vrptw = AntMultiTourSystem(n_ants=19, alpha=1.0102, beta=1.9535, rho=0.1059, q_tours=5, criteria=get_default_criteria())
-    amts_vrptw_routes, amts_vrptw_cost, amts_vrptw_history = amts_vrptw.solve(vrptw_data)
+    amts_prp = AntMultiTourSystem(n_ants=19, alpha=1.0102, beta=1.9535, rho=0.1059, q_tours=5, criteria=get_default_criteria())
+    amts_prp_routes, amts_prp_cost, amts_prp_history = amts_prp.solve(prp_data)
     elapsed = time.monotonic() - start
-    print(f"  Cost: {amts_vrptw_cost:.2f}, Routes: {len(amts_vrptw_routes)}, Time: {elapsed:.2f}s, Generations: {len(amts_vrptw_history)}, Feasible: {is_feasible_vrptw(amts_vrptw_routes, vrptw_data)}")
+    print(f"  Cost: {amts_prp_cost:.2f}, Routes: {len(amts_prp_routes)}, Time: {elapsed:.2f}s, Generations: {len(amts_prp_history)}, Feasible: {is_feasible_prp(amts_prp_routes, prp_data)}")
 
 # %% [markdown]
 # # Visualizations
@@ -1635,238 +1832,230 @@ def plot_routes(routes: Solution, instance: CvrpInstance, title: str = "Routes")
     plt.show()
 
 # %% [markdown]
-# #### GRASP Convergence
+# #### GRASP PRP
 
 # %%
-plot_convergence({"GRASP": cvrp_history}, title="GRASP CVRP Convergence")
-
-# %% [markdown]
-# #### GRASP Routes
+plot_convergence({"GRASP": prp_history}, title="GRASP PRP Convergence")
 
 # %%
-plot_routes(cvrp_routes, cvrp_data, title=f"GRASP CVRP — Cost: {cvrp_cost:.2f}, Routes: {len(cvrp_routes)}")
-
-# %%
-plot_convergence({"GRASP": vrptw_history}, title="GRASP VRPTW Convergence")
-
-# %%
-plot_routes(vrptw_routes, vrptw_data, title=f"GRASP VRPTW — Cost: {vrptw_cost:.2f}, Routes: {len(vrptw_routes)}")
-
-# %%
-plot_convergence({"AS": as_cvrp_history}, title="AS CVRP Convergence")
-
-# %% [markdown]
-# ##### AS Routes
-
-# %%
-plot_routes(as_cvrp_routes, cvrp_data, title=f"AS CVRP - Cost: {as_cvrp_cost:.2f}, Routes: {len(as_cvrp_routes)}")
+plot_routes(prp_routes, prp_data, title=f"GRASP PRP — Cost: {prp_cost:.2f}, Routes: {len(prp_routes)}")
 
 # %% [markdown]
 # #### Convergence comparison
 
 # %%
-plot_convergence({"GRASP": cvrp_history, "AS": as_cvrp_history, "MAX-MIN": mm_as_cvrp_history, "ACS": acs_cvrp_history, "AMTS": amts_cvrp_history}, title="CVRP Convergence")
-
-# %%
-plot_convergence({"GRASP": vrptw_history, "AS": as_vrptw_history, "MAX-MIN": mm_as_vrptw_history, "ACS": acs_vrptw_history, "AMTS": amts_vrptw_history}, title="VRPTW Convergence")
+plot_convergence({"GRASP": prp_history, "AS": as_prp_history, "MAX-MIN": mm_as_prp_history, "ACS": acs_prp_history, "AMTS": amts_prp_history}, title="PRP Convergence")
 
 # %% [markdown]
-# ### Parameter tuning
+# #### CVRP/VRPTW (commented out)
+
+# # %%
+# plot_convergence({"GRASP": cvrp_history}, title="GRASP CVRP Convergence")
+# plot_routes(cvrp_routes, cvrp_data, title=f"GRASP CVRP — Cost: {cvrp_cost:.2f}, Routes: {len(cvrp_routes)}")
+# plot_convergence({"GRASP": vrptw_history}, title="GRASP VRPTW Convergence")
+# plot_routes(vrptw_routes, vrptw_data, title=f"GRASP VRPTW — Cost: {vrptw_cost:.2f}, Routes: {len(vrptw_routes)}")
+# plot_convergence({"AS": as_cvrp_history}, title="AS CVRP Convergence")
+# plot_routes(as_cvrp_routes, cvrp_data, title=f"AS CVRP - Cost: {as_cvrp_cost:.2f}, Routes: {len(as_cvrp_routes)}")
+# plot_convergence({"GRASP": cvrp_history, "AS": as_cvrp_history, "MAX-MIN": mm_as_cvrp_history, "ACS": acs_cvrp_history, "AMTS": amts_cvrp_history}, title="CVRP Convergence")
+# plot_convergence({"GRASP": vrptw_history, "AS": as_vrptw_history, "MAX-MIN": mm_as_vrptw_history, "ACS": acs_vrptw_history, "AMTS": amts_vrptw_history}, title="VRPTW Convergence")
+
+# %% [markdown]
+# ### Parameter tuning (CVRP — commented out for PRP focus)
 
 # %% [markdown]
 # #### AS - Comparing alpha and beta
 
 # %%
-ant_system_a1_b2 = AntSystem(n_ants=20, alpha=1, beta=2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_a2p2_b2p2 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_a3_b2 = AntSystem(n_ants=20, alpha=3, beta=2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_a1_b1 = AntSystem(n_ants=20, alpha=1, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_a1_b3 = AntSystem(n_ants=20, alpha=1, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_a2_b1 = AntSystem(n_ants=20, alpha=2, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_a3_b1 = AntSystem(n_ants=20, alpha=3, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_a1_b3 = AntSystem(n_ants=20, alpha=1, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_a2_b3 = AntSystem(n_ants=20, alpha=2, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_a3_b3 = AntSystem(n_ants=20, alpha=3, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a1_b2 = AntSystem(n_ants=20, alpha=1, beta=2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a2p2_b2p2 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a3_b2 = AntSystem(n_ants=20, alpha=3, beta=2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a1_b1 = AntSystem(n_ants=20, alpha=1, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a1_b3 = AntSystem(n_ants=20, alpha=1, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a2_b1 = AntSystem(n_ants=20, alpha=2, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a3_b1 = AntSystem(n_ants=20, alpha=3, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a1_b3 = AntSystem(n_ants=20, alpha=1, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a2_b3 = AntSystem(n_ants=20, alpha=2, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_a3_b3 = AntSystem(n_ants=20, alpha=3, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
 
-as_a1_b2_cvrp_routes, as_a1_b2_cvrp_cost, as_a1_b2_cvrp_history = ant_system_a1_b2.solve(cvrp_data)
-as_a2p2_b2p2_cvrp_routes, as_a2p2_b2p2_cvrp_cost, as_a2p2_b2p2_cvrp_history = ant_system_a2p2_b2p2.solve(cvrp_data)
-as_a3_b2_cvrp_routes, as_a3_b2_cvrp_cost, as_a3_b2_cvrp_history = ant_system_a3_b2.solve(cvrp_data)
-as_a1_b1_cvrp_routes, as_a1_b1_cvrp_cost, as_a1_b1_cvrp_history = ant_system_a1_b1.solve(cvrp_data)
-as_a1_b3_cvrp_routes, as_a1_b3_cvrp_cost, as_a1_b3_cvrp_history = ant_system_a1_b3.solve(cvrp_data)
-as_a2_b1_cvrp_routes, as_a2_b1_cvrp_cost, as_a2_b1_cvrp_history = ant_system_a2_b1.solve(cvrp_data)
-as_a3_b1_cvrp_routes, as_a3_b1_cvrp_cost, as_a3_b1_cvrp_history = ant_system_a3_b1.solve(cvrp_data)
-as_a1_b3_cvrp_routes, as_a1_b3_cvrp_cost, as_a1_b3_cvrp_history = ant_system_a1_b3.solve(cvrp_data)
-as_a2_b3_cvrp_routes, as_a2_b3_cvrp_cost, as_a2_b3_cvrp_history = ant_system_a2_b3.solve(cvrp_data)
-as_a3_b3_cvrp_routes, as_a3_b3_cvrp_cost, as_a3_b3_cvrp_history = ant_system_a3_b3.solve(cvrp_data)
+# as_a1_b2_cvrp_routes, as_a1_b2_cvrp_cost, as_a1_b2_cvrp_history = ant_system_a1_b2.solve(cvrp_data)
+# as_a2p2_b2p2_cvrp_routes, as_a2p2_b2p2_cvrp_cost, as_a2p2_b2p2_cvrp_history = ant_system_a2p2_b2p2.solve(cvrp_data)
+# as_a3_b2_cvrp_routes, as_a3_b2_cvrp_cost, as_a3_b2_cvrp_history = ant_system_a3_b2.solve(cvrp_data)
+# as_a1_b1_cvrp_routes, as_a1_b1_cvrp_cost, as_a1_b1_cvrp_history = ant_system_a1_b1.solve(cvrp_data)
+# as_a1_b3_cvrp_routes, as_a1_b3_cvrp_cost, as_a1_b3_cvrp_history = ant_system_a1_b3.solve(cvrp_data)
+# as_a2_b1_cvrp_routes, as_a2_b1_cvrp_cost, as_a2_b1_cvrp_history = ant_system_a2_b1.solve(cvrp_data)
+# as_a3_b1_cvrp_routes, as_a3_b1_cvrp_cost, as_a3_b1_cvrp_history = ant_system_a3_b1.solve(cvrp_data)
+# as_a1_b3_cvrp_routes, as_a1_b3_cvrp_cost, as_a1_b3_cvrp_history = ant_system_a1_b3.solve(cvrp_data)
+# as_a2_b3_cvrp_routes, as_a2_b3_cvrp_cost, as_a2_b3_cvrp_history = ant_system_a2_b3.solve(cvrp_data)
+# as_a3_b3_cvrp_routes, as_a3_b3_cvrp_cost, as_a3_b3_cvrp_history = ant_system_a3_b3.solve(cvrp_data)
 
-plot_convergence({
-    "alpha = 1, beta = 2": as_a1_b2_cvrp_history, 
-    "alpha = 2.2, beta = 2.2": as_a2p2_b2p2_cvrp_history, 
-    "alpha = 3, beta = 2": as_a3_b2_cvrp_history,
-    "alpha = 1, beta = 1": as_a1_b1_cvrp_history,
-    "alpha = 1, beta = 3": as_a1_b3_cvrp_history,
-    "alpha = 2, beta = 1": as_a2_b1_cvrp_history,
-    "alpha = 3, beta = 1": as_a3_b1_cvrp_history,
-    "alpha = 1, beta = 3": as_a1_b3_cvrp_history,
-    "alpha = 2, beta = 3": as_a2_b3_cvrp_history,
-    "alpha = 3, beta = 3": as_a3_b3_cvrp_history,
-    }, "AS Convergence Test for alpha and beta")
+# plot_convergence({
+#     "alpha = 1, beta = 2": as_a1_b2_cvrp_history, 
+#     "alpha = 2.2, beta = 2.2": as_a2p2_b2p2_cvrp_history, 
+#     "alpha = 3, beta = 2": as_a3_b2_cvrp_history,
+#     "alpha = 1, beta = 1": as_a1_b1_cvrp_history,
+#     "alpha = 1, beta = 3": as_a1_b3_cvrp_history,
+#     "alpha = 2, beta = 1": as_a2_b1_cvrp_history,
+#     "alpha = 3, beta = 1": as_a3_b1_cvrp_history,
+#     "alpha = 1, beta = 3": as_a1_b3_cvrp_history,
+#     "alpha = 2, beta = 3": as_a2_b3_cvrp_history,
+#     "alpha = 3, beta = 3": as_a3_b3_cvrp_history,
+#     }, "AS Convergence Test for alpha and beta")
 
 # %% [markdown]
 # #### ACS - Comparing alpha and beta
 
 # %%
-ant_colony_system_a1_b2 = AntColonySystem(n_ants=20, alpha=1, beta=2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_colony_system_a2p2_b2p2 = AntColonySystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_colony_system_a3_b2 = AntColonySystem(n_ants=20, alpha=3, beta=2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_colony_system_a1_b1 = AntColonySystem(n_ants=20, alpha=1, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
-ant_colony_system_a1_b3 = AntColonySystem(n_ants=20, alpha=1, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
-ant_colony_system_a2_b1 = AntColonySystem(n_ants=20, alpha=2, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
-ant_colony_system_a3_b1 = AntColonySystem(n_ants=20, alpha=3, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
-ant_colony_system_a1_b3 = AntColonySystem(n_ants=20, alpha=1, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
-ant_colony_system_a2_b3 = AntColonySystem(n_ants=20, alpha=2, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
-ant_colony_system_a3_b3 = AntColonySystem(n_ants=20, alpha=3, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a1_b2 = AntColonySystem(n_ants=20, alpha=1, beta=2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a2p2_b2p2 = AntColonySystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a3_b2 = AntColonySystem(n_ants=20, alpha=3, beta=2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a1_b1 = AntColonySystem(n_ants=20, alpha=1, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a1_b3 = AntColonySystem(n_ants=20, alpha=1, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a2_b1 = AntColonySystem(n_ants=20, alpha=2, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a3_b1 = AntColonySystem(n_ants=20, alpha=3, beta=1, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a1_b3 = AntColonySystem(n_ants=20, alpha=1, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a2_b3 = AntColonySystem(n_ants=20, alpha=2, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_colony_system_a3_b3 = AntColonySystem(n_ants=20, alpha=3, beta=3, rho=0.1, criteria=[MaxGenerations(50)])
 
-acs_a1_b2_cvrp_routes, acs_a1_b2_cvrp_cost, acs_a1_b2_cvrp_history = ant_colony_system_a1_b2.solve(cvrp_data)
-acs_a2p2_b2p2_cvrp_routes, acs_a2p2_b2p2_cvrp_cost, acs_a2p2_b2p2_cvrp_history = ant_colony_system_a2p2_b2p2.solve(cvrp_data)
-acs_a3_b2_cvrp_routes, acs_a3_b2_cvrp_cost, acs_a3_b2_cvrp_history = ant_colony_system_a3_b2.solve(cvrp_data)
-acs_a1_b1_cvrp_routes, acs_a1_b1_cvrp_cost, acs_a1_b1_cvrp_history = ant_colony_system_a1_b1.solve(cvrp_data)
-acs_a1_b3_cvrp_routes, acs_a1_b3_cvrp_cost, acs_a1_b3_cvrp_history = ant_colony_system_a1_b3.solve(cvrp_data)
-acs_a2_b1_cvrp_routes, acs_a2_b1_cvrp_cost, acs_a2_b1_cvrp_history = ant_colony_system_a2_b1.solve(cvrp_data)
-acs_a3_b1_cvrp_routes, acs_a3_b1_cvrp_cost, acs_a3_b1_cvrp_history = ant_colony_system_a3_b1.solve(cvrp_data)
-acs_a1_b3_cvrp_routes, acs_a1_b3_cvrp_cost, acs_a1_b3_cvrp_history = ant_colony_system_a1_b3.solve(cvrp_data)
-acs_a2_b3_cvrp_routes, acs_a2_b3_cvrp_cost, acs_a2_b3_cvrp_history = ant_colony_system_a2_b3.solve(cvrp_data)
-acs_a3_b3_cvrp_routes, acs_a3_b3_cvrp_cost, acs_a3_b3_cvrp_history = ant_colony_system_a3_b3.solve(cvrp_data)
+# acs_a1_b2_cvrp_routes, acs_a1_b2_cvrp_cost, acs_a1_b2_cvrp_history = ant_colony_system_a1_b2.solve(cvrp_data)
+# acs_a2p2_b2p2_cvrp_routes, acs_a2p2_b2p2_cvrp_cost, acs_a2p2_b2p2_cvrp_history = ant_colony_system_a2p2_b2p2.solve(cvrp_data)
+# acs_a3_b2_cvrp_routes, acs_a3_b2_cvrp_cost, acs_a3_b2_cvrp_history = ant_colony_system_a3_b2.solve(cvrp_data)
+# acs_a1_b1_cvrp_routes, acs_a1_b1_cvrp_cost, acs_a1_b1_cvrp_history = ant_colony_system_a1_b1.solve(cvrp_data)
+# acs_a1_b3_cvrp_routes, acs_a1_b3_cvrp_cost, acs_a1_b3_cvrp_history = ant_colony_system_a1_b3.solve(cvrp_data)
+# acs_a2_b1_cvrp_routes, acs_a2_b1_cvrp_cost, acs_a2_b1_cvrp_history = ant_colony_system_a2_b1.solve(cvrp_data)
+# acs_a3_b1_cvrp_routes, acs_a3_b1_cvrp_cost, acs_a3_b1_cvrp_history = ant_colony_system_a3_b1.solve(cvrp_data)
+# acs_a1_b3_cvrp_routes, acs_a1_b3_cvrp_cost, acs_a1_b3_cvrp_history = ant_colony_system_a1_b3.solve(cvrp_data)
+# acs_a2_b3_cvrp_routes, acs_a2_b3_cvrp_cost, acs_a2_b3_cvrp_history = ant_colony_system_a2_b3.solve(cvrp_data)
+# acs_a3_b3_cvrp_routes, acs_a3_b3_cvrp_cost, acs_a3_b3_cvrp_history = ant_colony_system_a3_b3.solve(cvrp_data)
 
-plot_convergence({
-    "alpha = 1, beta = 2": acs_a1_b2_cvrp_history, 
-    "alpha = 2.2, beta = 2.2": acs_a2p2_b2p2_cvrp_history, 
-    "alpha = 3, beta = 2": acs_a3_b2_cvrp_history,
-    "alpha = 1, beta = 1": acs_a1_b1_cvrp_history,
-    "alpha = 1, beta = 3": acs_a1_b3_cvrp_history,
-    "alpha = 2, beta = 1": acs_a2_b1_cvrp_history,
-    "alpha = 3, beta = 1": acs_a3_b1_cvrp_history,
-    "alpha = 1, beta = 3": acs_a1_b3_cvrp_history,
-    "alpha = 2, beta = 3": acs_a2_b3_cvrp_history,
-    "alpha = 3, beta = 3": acs_a3_b3_cvrp_history,
-    }, "ACS Convergence Test for alpha and beta")
+# plot_convergence({
+#     "alpha = 1, beta = 2": acs_a1_b2_cvrp_history, 
+#     "alpha = 2.2, beta = 2.2": acs_a2p2_b2p2_cvrp_history, 
+#     "alpha = 3, beta = 2": acs_a3_b2_cvrp_history,
+#     "alpha = 1, beta = 1": acs_a1_b1_cvrp_history,
+#     "alpha = 1, beta = 3": acs_a1_b3_cvrp_history,
+#     "alpha = 2, beta = 1": acs_a2_b1_cvrp_history,
+#     "alpha = 3, beta = 1": acs_a3_b1_cvrp_history,
+#     "alpha = 1, beta = 3": acs_a1_b3_cvrp_history,
+#     "alpha = 2, beta = 3": acs_a2_b3_cvrp_history,
+#     "alpha = 3, beta = 3": acs_a3_b3_cvrp_history,
+#     }, "ACS Convergence Test for alpha and beta")
 
 # %% [markdown]
 # ### AS - Comparing Normal vs Elitist vs Rank-based Solution Selection
 
 # %%
-ant_system_normal = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="normal")
-ant_system_elitist_s2 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="eas", sigma=2)
-ant_system_elitist_s10 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="eas", sigma=10)
-ant_system_elitist_s20 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="eas", sigma=20)
-ant_system_rank_based = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="rankbased")
+# ant_system_normal = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="normal")
+# ant_system_elitist_s2 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="eas", sigma=2)
+# ant_system_elitist_s10 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="eas", sigma=10)
+# ant_system_elitist_s20 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="eas", sigma=20)
+# ant_system_rank_based = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)], solution_selection_type="rankbased")
 
-as_normal_cvrp_routes, as_normal_cvrp_cost, as_normal_cvrp_history = ant_system_normal.solve(cvrp_data)
-as_elitist_s2_cvrp_routes, as_elitist_s2_cvrp_cost, as_elitist_s2_cvrp_history = ant_system_elitist_s2.solve(cvrp_data)
-as_elitist_s10_cvrp_routes, as_elitist_s10_cvrp_cost, as_elitist_s10_cvrp_history = ant_system_elitist_s10.solve(cvrp_data)
-as_elitist_s20_cvrp_routes, as_elitist_s20_cvrp_cost, as_elitist_s20_cvrp_history = ant_system_elitist_s20.solve(cvrp_data)
-as_rank_based_cvrp_routes, as_rank_based_cvrp_cost, as_rank_based_cvrp_history = ant_system_rank_based.solve(cvrp_data)
+# as_normal_cvrp_routes, as_normal_cvrp_cost, as_normal_cvrp_history = ant_system_normal.solve(cvrp_data)
+# as_elitist_s2_cvrp_routes, as_elitist_s2_cvrp_cost, as_elitist_s2_cvrp_history = ant_system_elitist_s2.solve(cvrp_data)
+# as_elitist_s10_cvrp_routes, as_elitist_s10_cvrp_cost, as_elitist_s10_cvrp_history = ant_system_elitist_s10.solve(cvrp_data)
+# as_elitist_s20_cvrp_routes, as_elitist_s20_cvrp_cost, as_elitist_s20_cvrp_history = ant_system_elitist_s20.solve(cvrp_data)
+# as_rank_based_cvrp_routes, as_rank_based_cvrp_cost, as_rank_based_cvrp_history = ant_system_rank_based.solve(cvrp_data)
 
-plot_convergence({
-    "Normal": as_normal_cvrp_history, 
-    "Elitist, sigma = 2": as_elitist_s2_cvrp_history,
-    "Elitist, sigma = 10": as_elitist_s10_cvrp_history,
-    "Elitist, sigma = 20": as_elitist_s20_cvrp_history,
-    "Rank-based": as_rank_based_cvrp_history,
-    }, "AS Convergence Test for solution selection type")
+# plot_convergence({
+#     "Normal": as_normal_cvrp_history, 
+#     "Elitist, sigma = 2": as_elitist_s2_cvrp_history,
+#     "Elitist, sigma = 10": as_elitist_s10_cvrp_history,
+#     "Elitist, sigma = 20": as_elitist_s20_cvrp_history,
+#     "Rank-based": as_rank_based_cvrp_history,
+#     }, "AS Convergence Test for solution selection type")
 
 # %% [markdown]
 # ### AS - Comparing different rho values
 
 # %%
-ant_system_r0p1 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_r0p5 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.5, criteria=[MaxGenerations(50)])
-ant_system_r0p9 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.9, criteria=[MaxGenerations(50)])
+# ant_system_r0p1 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_r0p5 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.5, criteria=[MaxGenerations(50)])
+# ant_system_r0p9 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.9, criteria=[MaxGenerations(50)])
 
-_, _, as_r0p1_cvrp_history = ant_system_r0p1.solve(cvrp_data)
-_, _, as_r0p5_cvrp_history = ant_system_r0p5.solve(cvrp_data)
-_, _, as_r0p9_cvrp_history = ant_system_r0p9.solve(cvrp_data)
+# _, _, as_r0p1_cvrp_history = ant_system_r0p1.solve(cvrp_data)
+# _, _, as_r0p5_cvrp_history = ant_system_r0p5.solve(cvrp_data)
+# _, _, as_r0p9_cvrp_history = ant_system_r0p9.solve(cvrp_data)
 
-plot_convergence({
-    "rho = 0.1": as_r0p1_cvrp_history, 
-    "rho = 0.5": as_r0p5_cvrp_history, 
-    "rho = 0.9": as_r0p9_cvrp_history,
-    }, "AS Convergence Test for different rho values")
+# plot_convergence({
+#     "rho = 0.1": as_r0p1_cvrp_history, 
+#     "rho = 0.5": as_r0p5_cvrp_history, 
+#     "rho = 0.9": as_r0p9_cvrp_history,
+#     }, "AS Convergence Test for different rho values")
 
 # %% [markdown]
 # ### AS - Comparing different numbers of ants
 
 # %%
-ant_system_ants_20 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_ants_50 = AntSystem(n_ants=50, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_ants_100 = AntSystem(n_ants=100, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_ants_20 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_ants_50 = AntSystem(n_ants=50, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_ants_100 = AntSystem(n_ants=100, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
 
-_, _, as_ants20_cvrp_history = ant_system_ants_20.solve(cvrp_data)
-_, _, as_ants50_cvrp_history = ant_system_ants_50.solve(cvrp_data)
-_, _, as_ants100_cvrp_history = ant_system_ants_100.solve(cvrp_data)
+# _, _, as_ants20_cvrp_history = ant_system_ants_20.solve(cvrp_data)
+# _, _, as_ants50_cvrp_history = ant_system_ants_50.solve(cvrp_data)
+# _, _, as_ants100_cvrp_history = ant_system_ants_100.solve(cvrp_data)
 
-plot_convergence({
-    "20 ants": as_ants20_cvrp_history, 
-    "50 ants": as_ants50_cvrp_history, 
-    "100 ants": as_ants100_cvrp_history,
-    }, "AS Convergence Test for different numbers of ants")
+# plot_convergence({
+#     "20 ants": as_ants20_cvrp_history, 
+#     "50 ants": as_ants50_cvrp_history, 
+#     "100 ants": as_ants100_cvrp_history,
+#     }, "AS Convergence Test for different numbers of ants")
 
 # %% [markdown]
 # ### AS - Comparing different number of generations
 
 # %%
-ant_system_gen_20 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(20)])
-ant_system_gen_50 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
-ant_system_gen_100 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(100)])
+# ant_system_gen_20 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(20)])
+# ant_system_gen_50 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(50)])
+# ant_system_gen_100 = AntSystem(n_ants=20, alpha=2.2, beta=2.2, rho=0.1, criteria=[MaxGenerations(100)])
 
-_, _, as_gen20_cvrp_history = ant_system_gen_20.solve(cvrp_data)
-_, _, as_gen50_cvrp_history = ant_system_gen_50.solve(cvrp_data)
-_, _, as_gen100_cvrp_history = ant_system_gen_100.solve(cvrp_data)
+# _, _, as_gen20_cvrp_history = ant_system_gen_20.solve(cvrp_data)
+# _, _, as_gen50_cvrp_history = ant_system_gen_50.solve(cvrp_data)
+# _, _, as_gen100_cvrp_history = ant_system_gen_100.solve(cvrp_data)
 
-plot_convergence({
-    "20 gens": as_gen20_cvrp_history, 
-    "50 gens": as_gen50_cvrp_history, 
-    "100 gens": as_gen100_cvrp_history,
-    }, "AS Convergence Test for different numbers of generations")
+# plot_convergence({
+#     "20 gens": as_gen20_cvrp_history, 
+#     "50 gens": as_gen50_cvrp_history, 
+#     "100 gens": as_gen100_cvrp_history,
+#     }, "AS Convergence Test for different numbers of generations")
 
 # %% [markdown]
 # ### GRASP - Comparing different values for alpha
 
 # %%
-grasp_alpha_0p1 = GraspSolver(alpha=0.1, criteria=[MaxGenerations(50)])
-grasp_alpha_0p3 = GraspSolver(alpha=0.3, criteria=[MaxGenerations(50)])
-grasp_alpha_0p5 = GraspSolver(alpha=0.5, criteria=[MaxGenerations(50)])
-grasp_alpha_0p9 = GraspSolver(alpha=0.9, criteria=[MaxGenerations(50)])
+# grasp_alpha_0p1 = GraspSolver(alpha=0.1, criteria=[MaxGenerations(50)])
+# grasp_alpha_0p3 = GraspSolver(alpha=0.3, criteria=[MaxGenerations(50)])
+# grasp_alpha_0p5 = GraspSolver(alpha=0.5, criteria=[MaxGenerations(50)])
+# grasp_alpha_0p9 = GraspSolver(alpha=0.9, criteria=[MaxGenerations(50)])
 
-_, _, grasp_alpha_0p1_cvrp_history = grasp_alpha_0p1.solve(cvrp_data)
-_, _, grasp_alpha_0p3_cvrp_history = grasp_alpha_0p3.solve(cvrp_data)
-_, _, grasp_alpha_0p5_cvrp_history = grasp_alpha_0p5.solve(cvrp_data)
-_, _, grasp_alpha_0p9_cvrp_history = grasp_alpha_0p9.solve(cvrp_data)
+# _, _, grasp_alpha_0p1_cvrp_history = grasp_alpha_0p1.solve(cvrp_data)
+# _, _, grasp_alpha_0p3_cvrp_history = grasp_alpha_0p3.solve(cvrp_data)
+# _, _, grasp_alpha_0p5_cvrp_history = grasp_alpha_0p5.solve(cvrp_data)
+# _, _, grasp_alpha_0p9_cvrp_history = grasp_alpha_0p9.solve(cvrp_data)
 
-plot_convergence({
-    "alpha = 0.1": grasp_alpha_0p1_cvrp_history,
-    "alpha = 0.3": grasp_alpha_0p3_cvrp_history,
-    "alpha = 0.5": grasp_alpha_0p5_cvrp_history,
-    "alpha = 0.9": grasp_alpha_0p9_cvrp_history,
-}, "GRASP Convergence Test for different values of alpha")
+# plot_convergence({
+#     "alpha = 0.1": grasp_alpha_0p1_cvrp_history,
+#     "alpha = 0.3": grasp_alpha_0p3_cvrp_history,
+#     "alpha = 0.5": grasp_alpha_0p5_cvrp_history,
+#     "alpha = 0.9": grasp_alpha_0p9_cvrp_history,
+# }, "GRASP Convergence Test for different values of alpha")
 
 # %% [markdown]
 # ### GRASP - Comparing different numbers of generations
 
 # %%
-grasp_gen_20 = GraspSolver(criteria=[MaxGenerations(20)])
-grasp_gen_50 = GraspSolver(criteria=[MaxGenerations(50)])
-grasp_gen_100 = GraspSolver(criteria=[MaxGenerations(100)])
+# grasp_gen_20 = GraspSolver(criteria=[MaxGenerations(20)])
+# grasp_gen_50 = GraspSolver(criteria=[MaxGenerations(50)])
+# grasp_gen_100 = GraspSolver(criteria=[MaxGenerations(100)])
 
-_, _, grasp_gen20_cvrp_history = grasp_gen_20.solve(cvrp_data)
-_, _, grasp_gen50_cvrp_history = grasp_gen_50.solve(cvrp_data)
-_, _, grasp_gen100_cvrp_history = grasp_gen_100.solve(cvrp_data)
+# _, _, grasp_gen20_cvrp_history = grasp_gen_20.solve(cvrp_data)
+# _, _, grasp_gen50_cvrp_history = grasp_gen_50.solve(cvrp_data)
+# _, _, grasp_gen100_cvrp_history = grasp_gen_100.solve(cvrp_data)
 
-plot_convergence({
-    "20 gens": grasp_gen20_cvrp_history, 
-    "50 gens": grasp_gen50_cvrp_history, 
-    "100 gens": grasp_gen100_cvrp_history,
-    }, "GRASP Convergence Test for different numbers of generations")
+# plot_convergence({
+#     "20 gens": grasp_gen20_cvrp_history, 
+#     "50 gens": grasp_gen50_cvrp_history, 
+#     "100 gens": grasp_gen100_cvrp_history,
+#     }, "GRASP Convergence Test for different numbers of generations")
 
 # %% [markdown]
 # # Results
