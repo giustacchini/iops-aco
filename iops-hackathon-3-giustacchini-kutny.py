@@ -315,6 +315,15 @@ def is_feasible_vrptw(routes: Solution, instance: VrptwInstance) -> bool:
             return False
     return True
 
+def is_feasible_prp(routes: Solution, instance: PrpInstance) -> bool:
+    """Check capacity + time window constraints for each route."""
+    for route in routes:
+        if instance.demands[route].sum() > instance.capacity:
+            return False
+        if not is_route_tw_feasible(route, instance):
+            return False
+    return True
+
 # %% [markdown]
 # ### Local search operators
 # 
@@ -554,7 +563,7 @@ class GraspSolver(SolverBase):
 
 # %%
 def fine_tune(
-    instance: CvrpInstance | VrptwInstance,
+    instance: CvrpInstance | VrptwInstance | PrpInstance,
     run_name: str,
     config_generator,  # (multiplier) -> dict of config params
     result_generator,  # (config_dict, instance) -> (routes, cost, history)
@@ -564,12 +573,12 @@ def fine_tune(
 ):
     results_dir = "results"
     os.makedirs(results_dir, exist_ok=True)
-    inst_type = "vrptw" if isinstance(instance, VrptwInstance) else "cvrp"
+    inst_type = "vrptw" if isinstance(instance, VrptwInstance) else "prp" if isinstance(instance, PrpInstance) else "cvrp"
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     results_file = os.path.join(results_dir, f"{timestamp}_{inst_type}{run_name}.csv")
     results_img = os.path.join(results_dir, f"{timestamp}_{inst_type}{run_name}.jpg")
 
-    is_feasible = is_feasible_vrptw if isinstance(instance, VrptwInstance) else is_feasible_cvrp
+    is_feasible = is_feasible_vrptw if isinstance(instance, VrptwInstance) else is_feasible_prp if isinstance(instance, PrpInstance) else is_feasible_cvrp
 
     multiplier_step = (multiplier - min_multiplier) / n_iters
     best_cost = np.inf
