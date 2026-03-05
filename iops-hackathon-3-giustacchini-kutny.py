@@ -633,8 +633,9 @@ def fine_tune(
         n_routes = len(routes)
         feasible = is_feasible(routes, instance)
 
+        solution_str = str([[0] + route.tolist() + [0] for route in routes])
         result = {"cost": round(cost, 2), "routes": n_routes, "generations": len(history),
-                  "time_s": round(local_time, 2), "feasible": feasible}
+                  "time_s": round(local_time, 2), "feasible": feasible, "solution": solution_str}
         row = {"i": i + 1, "multiplier": round(multiplier, 4), **config, **result}
 
         # Write header on first iteration (keys derived from actual data)
@@ -653,9 +654,9 @@ def fine_tune(
         is_best = cost < best_cost
         if is_best or (cost == best_cost and local_time < best_time):
             if is_best:
-                print(f"  *** new best ({best_cost:.1f} -> {cost:.1f}) ***", end="")
+                print(f"  *** new best ({best_cost:.1f} -> {cost:.1f}) *** solution: {solution_str}", end="")
             else:
-                print(f"  *** time improvement ({best_time:.2f} -> {local_time:.2f}) ***", end="")
+                print(f"  *** time improvement ({best_time:.2f} -> {local_time:.2f}) *** solution: {solution_str}", end="")
             best_cost = cost
             best_time = local_time
             best_config = config
